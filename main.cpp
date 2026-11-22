@@ -1,6 +1,3 @@
-// mini-redis, Day 1: epoll event loop + connection buffers + PING.
-// Single-threaded, non-blocking, level-triggered epoll (Linux only).
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -15,16 +12,24 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <string_view>
+#include <vector>
+
+#include "commands.hpp"
+#include "resp.hpp"
+#include "aof.hpp"
 
 static constexpr int kMaxEvents = 1024;
 static constexpr size_t kReadChunk = 16 * 1024;
+
+static constexpr size_t kMaxPendingOutput = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------- helpers
 
 static void die(const char* msg) {
     perror(msg);
     std::exit(1);
-}
+} 
 
 // ------------------------------------------------------------- connection
 
@@ -34,10 +39,15 @@ struct Conn {
     std::string wbuf;       // reply bytes waiting to be written
     size_t woff = 0;        // how much of wbuf is already sent
     bool want_write = false;  // is EPOLLOUT currently registered?
+    bool close_after_write = false;  // QUIT / protocol error: hang up once flushed
+    bool pending = false;  // queued in g_pending for the end-of-tick flush
 };
 
 static int g_ep = -1;
 static std::unordered_map<int, Conn> g_conns;
+static Store g_store;
+static Aof g_aof;
+static std::vector<int> g_pending;  // connections with replies to send this tick
 
 static void update_events(Conn& c) {
     // Only ask for EPOLLOUT while we have unsent data; otherwise the
@@ -57,55 +67,35 @@ static void close_conn(int fd) {
     g_conns.erase(fd);
 }
 
-// ------------------------------------------------- command handling (stub)
-// Day 2 replaces this with a real incremental RESP parser + dispatcher.
-// For now we recognise exactly one command, in two forms:
-//   RESP array : "*1\r\n$4\r\nPING\r\n"   (what redis-cli sends)
-//   inline     : "PING\r\n"               (what `nc` / telnet sends)
 
-static bool equals_ci(const char* a, const char* b, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        unsigned char ca = static_cast<unsigned char>(a[i]);
-        unsigned char cb = static_cast<unsigned char>(b[i]);
-        if (ca >= 'A' && ca <= 'Z') ca = static_cast<unsigned char>(ca - 'A' + 'a');
-        if (cb >= 'A' && cb <= 'Z') cb = static_cast<unsigned char>(cb - 'A' + 'a');
-        if (ca != cb) return false;
-    }
-    return true;
-}
 
-static bool is_prefix_ci(const std::string& buf, const char* full) {
-    size_t n = std::strlen(full);
-    return buf.size() < n && equals_ci(buf.data(), full, buf.size());
-}
-
+// Parse every complete command in rbuf (pipelining), run it, append replies
+// to wbuf. A partial trailing command stays in rbuf until more bytes arrive.
 static void process_input(Conn& c) {
-    static const char kRespPing[] = "*1\r\n$4\r\nPING\r\n";
-    static const char kInlinePing[] = "PING\r\n";
-    constexpr size_t kRespLen = sizeof(kRespPing) - 1;
-    constexpr size_t kInlineLen = sizeof(kInlinePing) - 1;
+    static std::vector<std::string_view> args;  // reused: no allocation per command
+    size_t pos = 0;
 
-    while (!c.rbuf.empty()) {
-        if (c.rbuf.size() >= kRespLen && equals_ci(c.rbuf.data(), kRespPing, kRespLen)) {
-            c.rbuf.erase(0, kRespLen);
-            c.wbuf += "+PONG\r\n";
-        } else if (c.rbuf.size() >= kInlineLen && equals_ci(c.rbuf.data(), kInlinePing, kInlineLen)) {
-            c.rbuf.erase(0, kInlineLen);
-            c.wbuf += "+PONG\r\n";
-        } else if (is_prefix_ci(c.rbuf, kRespPing) ||
-                   is_prefix_ci(c.rbuf, kInlinePing)) {
-            return;  // partial command: wait for more bytes
-        } else {
-            std::fprintf(stderr, "UNMATCHED (%zu bytes): ", c.rbuf.size());
-            for (unsigned char ch : c.rbuf) {
-                std::fprintf(stderr, "\\x%02x", ch);
-            }
-            std::fprintf(stderr, "\n");
-            c.wbuf += "-ERR unknown command\r\n";
-            c.rbuf.clear();
-            return;
+    while (pos < c.rbuf.size() && !c.close_after_write) {
+        resp::ParseResult r =
+            resp::parse_command(c.rbuf.data() + pos, c.rbuf.size() - pos, args);
+
+        if (r.status == resp::Status::Incomplete) break;
+
+        if (r.status == resp::Status::Error) {
+            resp::add_error(c.wbuf, std::string("ERR Protocol error: ") + r.error);
+            c.close_after_write = true;
+            pos = c.rbuf.size();  // stream is garbage; discard everything
+            break;
         }
+
+        pos += r.consumed;
+        if (args.empty()) continue;  // blank inline line, "*0", "*-1"
+        if (cmd::execute(g_store, args, c.wbuf) == cmd::Action::Close)
+            c.close_after_write = true;
     }
+    // args point into rbuf, so erase only after the last command has run.
+    // One erase per batch (not per command) keeps big pipelines O(n).
+    c.rbuf.erase(0, pos);
 }
 
 // ------------------------------------------------------------ socket I/O
@@ -154,6 +144,7 @@ static bool flush_write(Conn& c) {
     if (c.woff == c.wbuf.size()) {
         c.wbuf.clear();
         c.woff = 0;
+        if (c.close_after_write) return false;  
     }
     update_events(c);
     return true;
@@ -184,7 +175,11 @@ static void handle_read(int fd) {
     }
 
     process_input(c);  // may execute 0, 1, or many pipelined commands
-    if (!flush_write(c)) close_conn(fd);  // one send() per batch of replies
+    if (c.wbuf.size() - c.woff > kMaxPendingOutput) {  // client isn't reading
+        close_conn(fd);
+        return;
+    }
+    if (!c.pending) { c.pending = true; g_pending.push_back(fd); }
 }
 
 static void handle_write(int fd) {
@@ -193,6 +188,15 @@ static void handle_write(int fd) {
     if (!flush_write(it->second)) close_conn(fd);
 }
 
+static void flush_pending() {
+    for (int fd : g_pending) {
+        auto it = g_conns.find(fd);
+        if (it == g_conns.end()) continue;  // closed meanwhile
+        it->second.pending = false;
+        if (!flush_write(it->second)) close_conn(fd);
+    }
+    g_pending.clear();
+}
 // ------------------------------------------------------------------ main
 
 int main(int argc, char** argv) {
@@ -200,6 +204,20 @@ int main(int argc, char** argv) {
 
     signal(SIGPIPE, SIG_IGN);  // writing to a closed socket must not kill us
 
+        // usage: miniredis [port] [aof-file | none] [always | everysec | no]
+    std::string aof_path = (argc > 2) ? argv[2] : "appendonly.aof";
+    FsyncPolicy policy = FsyncPolicy::EverySec;
+    if (argc > 3) {
+        std::string p = argv[3];
+        if (p == "always") policy = FsyncPolicy::Always;
+        else if (p == "everysec") policy = FsyncPolicy::EverySec;
+        else if (p == "no") policy = FsyncPolicy::No;
+        else {
+            std::fprintf(stderr, "usage: %s [port] [aof-file|none] [always|everysec|no]\n", argv[0]);
+            return 1;
+        }
+    }
+    if (aof_path != "none" && !g_aof.open_and_replay(aof_path, policy, g_store)) return 1;
     int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (listen_fd < 0) die("socket");
 
@@ -247,5 +265,11 @@ int main(int argc, char** argv) {
             if ((e & EPOLLOUT) && g_conns.count(fd)) handle_write(fd);
         }
         // Day 3: expire_sweep();
+                // End of tick, in this order:
+            g_store.expire_sweep();                // 1. active expiry (logs DELs)
+            g_aof.append(g_store.aof);             // 2. this tick's writes -> AOF buffer
+            g_store.aof.clear();
+            g_aof.flush();                         // 3. one write(), fsync per policy
+            flush_pending();                       // 4. only now send the replies
     }
 }
