@@ -52,6 +52,7 @@ public:
         auto it = live(key);
         return it == map_.end() ? nullptr : &it->second.value;
     }
+ 
 
     bool del(std::string_view key) {
         auto it = live(key);
@@ -239,6 +240,11 @@ inline Action get(Store& s, const Args& a, std::string& out) {
     else resp::add_null(out);
     return Action::Continue;
 }
+inline Action strlen_cmd(Store& s, const Args& a, std::string& out) {
+    const std::string* v = s.get(a[1]);                       // look up the key
+    resp::add_int(out, v ? static_cast<long long>(v->size()) : 0);  // length, or 0 if missing
+    return Action::Continue;
+}
 inline Action del(Store& s, const Args& a, std::string& out) {
     long long n = 0;
     for (size_t i = 1; i < a.size(); i++) n += s.del(a[i]) ? 1 : 0;
@@ -348,6 +354,7 @@ inline const std::unordered_map<std::string, Spec>& table() {
         {"CONFIG",    {config,    -2, Log::None}},
         {"COMMAND",   {command,   -1, Log::None}},
         {"QUIT",      {quit,      -1, Log::None}},
+        {"STRLEN",    {strlen_cmd, 2, Log::None}},
     };
     return t;
 }
